@@ -9,8 +9,7 @@ Job runner — processes a single scrape job end-to-end:
 """
 
 import logging
-import uuid
-from datetime import datetime
+import json
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
@@ -23,10 +22,6 @@ log = logging.getLogger(__name__)
 
 
 def _compute_confidence(nlp_confidence: float, geocode_source: str) -> float:
-    """
-    Composite confidence score.
-    NLP confidence × geocode certainty weight.
-    """
     source_weight = {"gazetteer_exact": 1.0, "gazetteer_fuzzy": 0.85, "nominatim": 0.7}
     return round(nlp_confidence * source_weight.get(geocode_source, 0.5), 3)
 
@@ -49,14 +44,13 @@ def run_news_scrape_job(job_id: str | None = None) -> dict:
         else:
             db.execute(text("""
                 UPDATE scrape_jobs SET status = 'RUNNING', started_at = NOW()
-                WHERE id = :id::uuid
+                WHERE id = CAST(:id AS uuid)
             """), {"id": job_id})
             db.commit()
 
         articles: list[ScrapedArticle] = run_all_news_scrapers()
 
         for article in articles:
-            # Skip if we already have this URL
             exists = db.execute(text(
                 "SELECT 1 FROM reports WHERE source_url = :url LIMIT 1"
             ), {"url": article.url}).fetchone()
@@ -71,7 +65,6 @@ def run_news_scrape_job(job_id: str | None = None) -> dict:
                 skipped_count += 1
                 continue
 
-            # Geocode
             primary_location = extraction.get("primary_location")
             geo = None
             geocode_status = "UNRESOLVED"
@@ -94,6 +87,43 @@ def run_news_scrape_job(job_id: str | None = None) -> dict:
 
             waste_type = waste_type_to_enum(extraction.get("waste_type", "unknown"))
 
+            # If the article describes a collection event, create a WasteFlow record
+            is_collection = extraction.get("is_collection_event", False)
+            if is_collection and geo:
+                try:
+                    db.execute(text("""
+                        INSERT INTO waste_flows (
+                            id, waste_type, status,
+                            origin_lat, origin_lng,
+                            lga, ward,
+                            estimated_tonnage,
+                            collected_at, notes,
+                            created_at, updated_at
+                        ) VALUES (
+                            gen_random_uuid(),
+                            CAST(:waste_type AS "WasteType"),
+                            CAST('COLLECTED' AS "FlowStatus"),
+                            :lat, :lng,
+                            :lga, :ward,
+                            :tonnage,
+                            NOW(), :notes,
+                            NOW(), NOW()
+                        )
+                    """), {
+                        "waste_type": waste_type,
+                        "lat": geo.latitude,
+                        "lng": geo.longitude,
+                        "lga": geo.lga if hasattr(geo, 'lga') else None,
+                        "ward": geo.ward if hasattr(geo, 'ward') else None,
+                        "tonnage": extraction.get("estimated_tonnage"),
+                        "notes": f"Auto-detected from article: {article.url}",
+                    })
+                    db.commit()
+                    log.info("Created WasteFlow record from collection event at %s", primary_location)
+                except Exception as flow_exc:
+                    log.warning("Failed to create WasteFlow: %s", flow_exc)
+                    db.rollback()
+
             db.execute(text("""
                 INSERT INTO reports (
                     id, raw_text, source_url, source_type,
@@ -105,9 +135,9 @@ def run_news_scrape_job(job_id: str | None = None) -> dict:
                 ) VALUES (
                     gen_random_uuid(),
                     :raw_text, :source_url, 'NEWS_SCRAPE',
-                    :location_text, :waste_type::\"WasteType\",
+                    :location_text, CAST(:waste_type AS "WasteType"),
                     :severity, :urgency,
-                    :geocode_status::\"GeocodeStatus\",
+                    CAST(:geocode_status AS "GeocodeStatus"),
                     :lat, :lng, :geocode_source,
                     :confidence, 'UNVERIFIED',
                     NOW(), NOW(), NOW()
@@ -131,11 +161,11 @@ def run_news_scrape_job(job_id: str | None = None) -> dict:
         db.execute(text("""
             UPDATE scrape_jobs
             SET status = 'DONE', completed_at = NOW(),
-                metadata = :meta::jsonb
-            WHERE id = :id::uuid
+                metadata = CAST(:meta AS jsonb)
+            WHERE id = CAST(:id AS uuid)
         """), {
             "id": job_id,
-            "meta": f'{{"created": {created_count}, "skipped": {skipped_count}}}',
+            "meta": json.dumps({"created": created_count, "skipped": skipped_count}),
         })
         db.commit()
         log.info("Job %s done: %d created, %d skipped", job_id, created_count, skipped_count)
@@ -143,12 +173,15 @@ def run_news_scrape_job(job_id: str | None = None) -> dict:
 
     except Exception as exc:
         log.error("Job %s failed: %s", job_id, exc, exc_info=True)
-        db.execute(text("""
-            UPDATE scrape_jobs
-            SET status = 'FAILED', completed_at = NOW(), error_msg = :err
-            WHERE id = :id::uuid
-        """), {"id": job_id, "err": str(exc)})
-        db.commit()
+        try:
+            db.execute(text("""
+                UPDATE scrape_jobs
+                SET status = 'FAILED', completed_at = NOW(), error_msg = :err
+                WHERE id = CAST(:id AS uuid)
+            """), {"id": job_id, "err": str(exc)[:2000]})
+            db.commit()
+        except Exception:
+            pass
         raise
     finally:
         db.close()

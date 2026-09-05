@@ -12,6 +12,7 @@ Setup:
 The incoming message format follows WhatsApp Cloud API v18+.
 """
 
+import asyncio
 import logging
 from fastapi import APIRouter, Request, Response, HTTPException, Query
 from sqlalchemy import text
@@ -80,15 +81,17 @@ async def _process_message(msg: dict, contacts: list):
     pin_lng = location_pin.get("longitude") if location_pin else None
     pin_name = location_pin.get("name") if location_pin else None
 
-    # Run NLP extraction on the message text
-    extraction = extract_from_text(f"WhatsApp citizen report from {sender}: {raw_text}")
+    # Run NLP extraction on the message text (offloaded to thread pool — sync HTTP call)
+    extraction = await asyncio.get_event_loop().run_in_executor(
+        None, extract_from_text, f"WhatsApp citizen report from {sender}: {raw_text}"
+    )
 
     db = SessionLocal()
     try:
         # Use location pin if provided, else geocode extracted text
         geo_lat = pin_lat
         geo_lng = pin_lng
-        geocode_status = "RESOLVED_NOMINATIM" if pin_lat else "UNRESOLVED"
+        geocode_status = "RESOLVED_GAZETTEER" if pin_lat else "UNRESOLVED"
         geocode_source = "whatsapp_pin" if pin_lat else None
 
         if not pin_lat and extraction.get("primary_location"):

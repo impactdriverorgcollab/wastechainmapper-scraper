@@ -39,6 +39,8 @@ class ReportSourceType(str, enum.Enum):
 
 class WasteType(str, enum.Enum):
     MUNICIPAL = "MUNICIPAL"
+    ORGANIC = "ORGANIC"
+    PLASTIC = "PLASTIC"
     INDUSTRIAL = "INDUSTRIAL"
     MEDICAL = "MEDICAL"
     ELECTRONIC = "ELECTRONIC"
@@ -67,7 +69,7 @@ class Report(Base):
     )
     extracted_location_text = Column(Text)
     extracted_waste_type = Column(
-        PgEnum("MUNICIPAL", "INDUSTRIAL", "MEDICAL", "ELECTRONIC",
+        PgEnum("MUNICIPAL", "ORGANIC", "PLASTIC", "INDUSTRIAL", "MEDICAL", "ELECTRONIC",
                "CONSTRUCTION", "MIXED", "UNKNOWN", name="WasteType", create_type=False)
     )
     extracted_severity = Column(Text)

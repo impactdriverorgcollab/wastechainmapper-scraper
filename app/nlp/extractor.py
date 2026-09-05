@@ -8,6 +8,7 @@ Returns a typed dict; caller decides whether to write to DB.
 
 import json
 import logging
+import re
 from typing import TypedDict, Optional
 import anthropic
 from app.config import settings
@@ -20,16 +21,18 @@ EXTRACTION_SYSTEM = """You are a data extraction assistant for an environmental 
 tracking illegal waste dumping in Rivers State, Nigeria. Extract structured information from
 Nigerian news articles and social media posts about waste and environmental issues."""
 
-EXTRACTION_PROMPT = """Extract waste dumping information from the text below.
+EXTRACTION_PROMPT = """Extract environmental incident information from the text below.
 
 Return ONLY a valid JSON object with these fields:
 - is_dumping_related (boolean): true if the text describes actual waste dumping, illegal disposal, or environmental pollution with a specific location
+- is_collection_event (boolean): true if the text describes waste collection, removal, clean-up, or evacuation of waste from a site by authorities or contractors
 - location_mentions (array of strings): exact location names mentioned — communities, areas, LGAs, landmarks in Rivers State
 - primary_location (string or null): the single most specific location mentioned (community or area name, not the state itself)
-- waste_type (string): one of: municipal, industrial, medical, electronic, construction, mixed, unknown
+- waste_type (string): one of: municipal, organic, plastic, industrial, medical, electronic, construction, mixed, unknown
 - severity (string): one of: critical, high, moderate, low, unknown
 - urgency (string): one of: immediate, soon, routine, unknown
-- confidence (number 0.0-1.0): how confident are you this describes a real, geolocatable dumping incident?
+- estimated_tonnage (number or null): if the text mentions a specific tonnage or quantity of waste collected/removed, extract the number in metric tonnes; null if not mentioned
+- confidence (number 0.0-1.0): how confident are you this describes a real, geolocatable incident?
 - summary (string): 1-2 sentence summary of the incident
 
 Text:
@@ -38,22 +41,26 @@ Text:
 
 class ExtractionResult(TypedDict):
     is_dumping_related: bool
+    is_collection_event: bool
     location_mentions: list[str]
     primary_location: Optional[str]
     waste_type: str
     severity: str
     urgency: str
+    estimated_tonnage: Optional[float]
     confidence: float
     summary: str
 
 
 _FALLBACK: ExtractionResult = {
     "is_dumping_related": False,
+    "is_collection_event": False,
     "location_mentions": [],
     "primary_location": None,
     "waste_type": "unknown",
     "severity": "unknown",
     "urgency": "unknown",
+    "estimated_tonnage": None,
     "confidence": 0.0,
     "summary": "",
 }
@@ -77,9 +84,9 @@ def extract_from_text(text: str) -> ExtractionResult:
 
         # Strip markdown code fences if Claude wraps the JSON
         if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
+            raw = re.sub(r'^```\w*\s*', '', raw)
+            raw = re.sub(r'\s*```$', '', raw)
+            raw = raw.strip()
 
         result: ExtractionResult = json.loads(raw)
         return result
@@ -95,6 +102,8 @@ def extract_from_text(text: str) -> ExtractionResult:
 def waste_type_to_enum(value: str) -> str:
     mapping = {
         "municipal": "MUNICIPAL",
+        "organic": "ORGANIC",
+        "plastic": "PLASTIC",
         "industrial": "INDUSTRIAL",
         "medical": "MEDICAL",
         "electronic": "ELECTRONIC",

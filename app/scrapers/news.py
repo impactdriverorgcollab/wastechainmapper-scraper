@@ -1,21 +1,17 @@
 """
-News scrapers for Rivers State waste/dumping coverage.
+News scrapers using RSS feeds — avoids 403 blocks from direct search-page scraping.
 
-Sites targeted:
-  - tidenewsonline.com  (Rivers State-focused; highest local relevance)
-  - vanguardngr.com
-  - punchng.com
-
-Scraping approach: fetch each site's search results page for relevant keywords,
-extract article title + summary + URL. Full article text is fetched separately.
-
-NOTE: CSS selectors are as of mid-2026 and may drift. If a scraper returns 0 results,
-inspect the live page and update the selectors below.
+Sources:
+  - Google News RSS  (keyword search, aggregates Vanguard / Punch / Tide / Guardian)
+  - Vanguard RSS     (general feed, filtered by keywords)
+  - Punch RSS        (general feed, filtered by keywords)
 """
 
 import logging
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from typing import Optional
 import httpx
 from bs4 import BeautifulSoup
@@ -27,6 +23,16 @@ KEYWORDS = [
     "waste dumping Port Harcourt",
     "refuse dump Rivers",
     "environmental pollution Rivers State",
+    "waste collection Rivers State",
+    "refuse collection Port Harcourt",
+    "waste evacuation Rivers",
+    "clean-up Rivers State environment",
+]
+
+KEYWORD_FILTER = [
+    "dump", "waste", "refuse", "pollution", "illegal dump",
+    "sanitation", "sewage", "rivers state", "port harcourt",
+    "collection", "evacuation", "clean-up", "cleanup", "remediation",
 ]
 
 HEADERS = {
@@ -47,23 +53,60 @@ class ScrapedArticle:
     source: str
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _fetch(url: str, timeout: int = 15) -> Optional[BeautifulSoup]:
+def _fetch_text(url: str, timeout: int = 20) -> Optional[str]:
     try:
         r = httpx.get(url, headers=HEADERS, timeout=timeout, follow_redirects=True)
         r.raise_for_status()
-        return BeautifulSoup(r.text, "lxml")
+        return r.text
     except Exception as exc:
         log.warning("fetch failed %s: %s", url, exc)
         return None
 
 
+def _parse_rss(xml_text: str) -> list[dict]:
+    """Return list of {title, link, description, pubDate} dicts from an RSS feed."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        log.warning("RSS parse error: %s", exc)
+        return []
+
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    items = []
+    for item in root.iter("item"):
+        def _t(tag: str) -> str:
+            el = item.find(tag)
+            return el.text.strip() if el is not None and el.text else ""
+
+        pub_raw = _t("pubDate")
+        published_at = None
+        if pub_raw:
+            try:
+                published_at = parsedate_to_datetime(pub_raw)
+            except Exception:
+                pass
+
+        items.append({
+            "title": _t("title"),
+            "link": _t("link"),
+            "description": _t("description"),
+            "published_at": published_at,
+        })
+    return items
+
+
+def _is_relevant(title: str, description: str) -> bool:
+    combined = (title + " " + description).lower()
+    return any(kw in combined for kw in KEYWORD_FILTER)
+
+
 def _fetch_article_text(url: str) -> str:
-    soup = _fetch(url)
-    if not soup:
+    raw = _fetch_text(url, timeout=15)
+    if not raw:
         return ""
-    # Generic: grab the largest <article> or <div class="content"> block
+    soup = BeautifulSoup(raw, "html.parser")
     for selector in ["article", ".entry-content", ".post-content", ".article-body", "main"]:
         el = soup.select_one(selector)
         if el:
@@ -71,88 +114,97 @@ def _fetch_article_text(url: str) -> str:
     return soup.get_text(separator=" ", strip=True)[:3000]
 
 
-# ── The Tide News Online ──────────────────────────────────────────────────────
+# ── Google News RSS ───────────────────────────────────────────────────────────
 
-def scrape_tide_news(keyword: str = "illegal dumping Rivers State") -> list[ScrapedArticle]:
-    """tidenewsonline.com — Rivers State daily."""
+def scrape_google_news(keyword: str) -> list[ScrapedArticle]:
+    """
+    Google News RSS aggregates Nigerian outlets without requiring auth.
+    Results include Vanguard, Punch, Guardian, Channels, Tide, etc.
+    """
+    encoded = keyword.replace(" ", "+")
+    url = f"https://news.google.com/rss/search?q={encoded}&hl=en-NG&gl=NG&ceid=NG:en"
+    raw = _fetch_text(url)
+    if not raw:
+        return []
+
+    items = _parse_rss(raw)
     results: list[ScrapedArticle] = []
-    url = f"https://www.tidenewsonline.com/?s={keyword.replace(' ', '+')}"
-    soup = _fetch(url)
-    if not soup:
-        return results
 
-    # Tide uses a standard WordPress theme; articles are in .post or article tags
-    for article in soup.select("article.post, .post-listing article")[:10]:
-        title_el = article.select_one("h2 a, h3 a, .entry-title a")
-        if not title_el:
+    for item in items[:15]:
+        title = item["title"]
+        link = item["link"]
+        description = BeautifulSoup(item["description"], "html.parser").get_text()
+
+        if not _is_relevant(title, description):
             continue
-        title = title_el.get_text(strip=True)
-        href = title_el.get("href", "")
-        summary_el = article.select_one(".entry-summary, .post-excerpt, p")
-        summary = summary_el.get_text(strip=True)[:400] if summary_el else ""
-        full = _fetch_article_text(href)
+
+        full = _fetch_article_text(link)
         results.append(ScrapedArticle(
-            title=title, url=href, summary=summary,
-            full_text=full or summary, published_at=None, source="tidenewsonline.com",
+            title=title,
+            url=link,
+            summary=description[:400],
+            full_text=full or description,
+            published_at=item["published_at"],
+            source="google_news",
         ))
 
-    log.info("Tide News: %d articles for '%s'", len(results), keyword)
+    log.info("Google News RSS: %d relevant articles for '%s'", len(results), keyword)
     return results
 
 
-# ── Vanguard ─────────────────────────────────────────────────────────────────
+# ── Vanguard RSS ──────────────────────────────────────────────────────────────
 
-def scrape_vanguard(keyword: str = "illegal dumping Rivers State") -> list[ScrapedArticle]:
-    """vanguardngr.com"""
+def scrape_vanguard_rss() -> list[ScrapedArticle]:
+    raw = _fetch_text("https://www.vanguardngr.com/feed/")
+    if not raw:
+        return []
+
+    items = _parse_rss(raw)
     results: list[ScrapedArticle] = []
-    url = f"https://www.vanguardngr.com/?s={keyword.replace(' ', '+')}"
-    soup = _fetch(url)
-    if not soup:
-        return results
 
-    for article in soup.select(".td_module_wrap, article.post")[:10]:
-        title_el = article.select_one(".entry-title a, h3 a")
-        if not title_el:
+    for item in items[:50]:
+        if not _is_relevant(item["title"], item["description"]):
             continue
-        title = title_el.get_text(strip=True)
-        href = title_el.get("href", "")
-        summary_el = article.select_one(".td-excerpt, .entry-summary")
-        summary = summary_el.get_text(strip=True)[:400] if summary_el else ""
-        full = _fetch_article_text(href)
+        description = BeautifulSoup(item["description"], "html.parser").get_text()
+        full = _fetch_article_text(item["link"])
         results.append(ScrapedArticle(
-            title=title, url=href, summary=summary,
-            full_text=full or summary, published_at=None, source="vanguardngr.com",
+            title=item["title"],
+            url=item["link"],
+            summary=description[:400],
+            full_text=full or description,
+            published_at=item["published_at"],
+            source="vanguardngr.com",
         ))
 
-    log.info("Vanguard: %d articles for '%s'", len(results), keyword)
+    log.info("Vanguard RSS: %d relevant articles", len(results))
     return results
 
 
-# ── Punch ────────────────────────────────────────────────────────────────────
+# ── Punch RSS ─────────────────────────────────────────────────────────────────
 
-def scrape_punch(keyword: str = "illegal dumping Rivers State") -> list[ScrapedArticle]:
-    """punchng.com"""
+def scrape_punch_rss() -> list[ScrapedArticle]:
+    raw = _fetch_text("https://punchng.com/feed/")
+    if not raw:
+        return []
+
+    items = _parse_rss(raw)
     results: list[ScrapedArticle] = []
-    url = f"https://punchng.com/?s={keyword.replace(' ', '+')}"
-    soup = _fetch(url)
-    if not soup:
-        return results
 
-    for article in soup.select("article.post, .post-block")[:10]:
-        title_el = article.select_one("h2 a, h3 a, .post-title a")
-        if not title_el:
+    for item in items[:50]:
+        if not _is_relevant(item["title"], item["description"]):
             continue
-        title = title_el.get_text(strip=True)
-        href = title_el.get("href", "")
-        summary_el = article.select_one(".entry-summary, p")
-        summary = summary_el.get_text(strip=True)[:400] if summary_el else ""
-        full = _fetch_article_text(href)
+        description = BeautifulSoup(item["description"], "html.parser").get_text()
+        full = _fetch_article_text(item["link"])
         results.append(ScrapedArticle(
-            title=title, url=href, summary=summary,
-            full_text=full or summary, published_at=None, source="punchng.com",
+            title=item["title"],
+            url=item["link"],
+            summary=description[:400],
+            full_text=full or description,
+            published_at=item["published_at"],
+            source="punchng.com",
         ))
 
-    log.info("Punch: %d articles for '%s'", len(results), keyword)
+    log.info("Punch RSS: %d relevant articles", len(results))
     return results
 
 
@@ -160,10 +212,14 @@ def scrape_punch(keyword: str = "illegal dumping Rivers State") -> list[ScrapedA
 
 def run_all_news_scrapers() -> list[ScrapedArticle]:
     articles: list[ScrapedArticle] = []
-    for keyword in KEYWORDS[:2]:  # limit keywords per run to avoid rate-limiting
-        articles.extend(scrape_tide_news(keyword))
-        articles.extend(scrape_vanguard(keyword))
-        articles.extend(scrape_punch(keyword))
+
+    # Google News RSS — keyword-targeted, best signal-to-noise
+    for keyword in KEYWORDS[:3]:
+        articles.extend(scrape_google_news(keyword))
+
+    # General RSS feeds — catch anything keyword search missed
+    articles.extend(scrape_vanguard_rss())
+    articles.extend(scrape_punch_rss())
 
     # Deduplicate by URL
     seen: set[str] = set()
